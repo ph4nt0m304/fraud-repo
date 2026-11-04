@@ -1,0 +1,620 @@
+===============================================================================
+REVERSER LE MT700 — PROTOCOLE DE CRÉDIT DOCUMENTAIRE SWIFT
+Guide pratique pour le reverse engineering du parsing, de la validation
+et du mapping MT700
+===============================================================================
+
+Première chose à clarifier : personne ne « hack » le MT700 sur le fil. Le fil
+est signé. Ce que les gens reversent réellement, c'est LE LOGICIEL QUI LIT LE
+MT700 — le middleware, les moteurs de mapping et les front-ends de
+trade finance qui se trouvent entre SWIFT et le core banking. C'est là que le
+protocole devient intéressant, parce que c'est là que le parser prend des
+décisions que la spec ne contraint pas entièrement.
+
+
+===============================================================================
+PARTIE 1 — CE QU'EST RÉELLEMENT LE MT700
+===============================================================================
+
+Le MT700 est un message SWIFT FIN : « Issue of a Documentary Credit »
+(émission d'un crédit documentaire). C'est l'instruction qu'une banque envoie
+pour émettre ou notifier une lettre de crédit en trade finance. Texte brut,
+grammaire fixe, piloté par des tags.
+
+Messages frères :
+
+  MT 700  Émission d'un crédit documentaire
+  MT 701  Continuation d'un 700
+  MT 705  Pré-avis
+  MT 707  Modification
+  MT 710  Avis du crédit documentaire d'une banque tierce
+  MT 711  Avis du crédit documentaire d'une banque tierce (continuation)
+  MT 720  Transfert d'un crédit documentaire
+  MT 721  Transfert d'un crédit documentaire (continuation)
+  MT 734  Avis de refus
+  MT 740  Cession du produit
+  MT 747  Modification des frais
+  MT 750  Avis de divergence
+  MT 752  Autorisation de payer / accepter / négocier
+
+
+-------------------------------------------------------------------------------
+1.1 ENVELOPPE FIN — LES CINQ BLOCS
+-------------------------------------------------------------------------------
+
+Chaque message FIN est une chaîne plate de blocs :
+
+  {1:F01BANKBEBBAXXX0000000000}
+  {2:I700BANKUS33XXXXN}
+  {3:{108:REF1234567890}{111:001}{121:uuid-here}}
+  {4:
+  :27:1/1
+  :40A:IRREVOCABLE
+  :20:LC123456789
+  :31C:251104
+  :40E:UCP LATEST VERSION
+  ...
+  -}
+  {5:{MAC:12345678}{CHK:ABCDEF123456}}
+
+  Bloc 1 — En-tête de base (Basic Header)
+      App id « F » (FIN), service id « 01 », adresse LT (12 caractères :
+      BIC8 de la banque + branche + terminal), session/séquence ; pour la
+      sortie aussi OS/séquence.
+
+  Bloc 2 — En-tête applicatif (Application Header)
+      « I » = entrée, « O » = sortie, type de message « 700 », LT
+      destination/source, priorité, delivery monitoring, période
+      d'obsolescence.
+
+  Bloc 3 — En-tête utilisateur (User Header, optionnel)
+      Contient 108 (Message User Reference, MUR), 111/113 (identifiants de
+      service), 121 (unique end-to-end transaction reference, UETR),
+      152 (validation), 165/433, etc.
+
+  Bloc 4 — Bloc texte (Text Block)
+      La charge utile réelle du MT700. Lignes « :TAG:valeur », séparées par
+      CRLF, terminées par « -} ».
+
+  Bloc 5 — Trailer
+      {MAC:...} (authentificateur historique) et {CHK:...} (checksum), plus
+      éventuellement {PDE:}, {DLM:}, {TNG:}.
+
+
+-------------------------------------------------------------------------------
+1.2 GRAMMAIRE DES CHAMPS DANS LE BLOC 4
+-------------------------------------------------------------------------------
+
+Un champ s'écrit « :NNx: » où NN est le numéro et x une LETTRE D'OPTION
+facultative qui change entièrement le format.
+
+Exemple : le champ 50 a les options :
+  50    (sans lettre, obsolète)
+  50A   BIC
+  50F   identifiant de partie + nom/adresse
+  50K   compte + nom/adresse
+
+Même numéro, schéma complètement différent.
+
+Les codes de format dans la norme ressemblent à :
+
+  50a   [/34x] 4!a2!a2!c[3!c]   ou   [/34x] 4*35x
+  59    [/34x] 4*35x
+  32B   3!a 15d
+  39A   2n/2n
+  45A   50*65x
+  46A   50*65x
+
+À lire ainsi :
+  4*35x  = jusqu'à 4 lignes de 35 caractères max
+  3!a    = exactement 3 alphabétiques (devise)
+  15d    = jusqu'à 15 chiffres, virgule comme séparateur décimal
+
+C'est tout le langage de schéma — un petit dialecte de regex.
+
+JEU DE CARACTÈRES (jeu X) :
+  a-z A-Z 0-9 / - ? : ( ) . , ' + et l'espace
+  Pas de « & », pas de « # », pas de « < », « > », pas de guillemets.
+  Certains champs utilisent des jeux restreints :
+    n = numérique
+    c = A-Z a-z 0-9 plus une certaine ponctuation
+    x = n'importe quel caractère X
+
+Cette restriction est la raison pour laquelle le MT classique est résistant à
+l'injection PAR CONSTRUCTION — mais seulement si le parser l'applique.
+
+
+===============================================================================
+PARTIE 2 — COMMENT LE REVERSE ENGINEERING SE DÉROULE RÉELLEMENT
+===============================================================================
+
+Méthodologie réelle, dans l'ordre. Même pipeline que vous soyez un chercheur
+en sécurité qui audite un payment hub ou un analyste fraude qui reverse une
+arnaque.
+
+
+-------------------------------------------------------------------------------
+ÉTAPE 1 — ACQUÉRIR DES SPÉCIMENS
+-------------------------------------------------------------------------------
+
+Sources, globalement par ordre de propreté :
+
+  - SPEC PUBLIQUE : les volumes « Standards MT » de SWIFT sont payants mais
+    largement recopiés ; le catalogue des champs du 700 est bien documenté
+    dans la littérature trade finance.
+
+  - DOCS ÉDITEURS : chaque TMS (trade management system) fournit des messages
+    d'exemple dans son guide d'intégration — Finastra, CGI, Finacle,
+    Tietoevry, et la foule du middleware (IBM Transformation Extender, Axway,
+    Bottomline, ACI, Volante). Ces guides sont des mines d'or : ils montrent
+    LEUR interprétation.
+
+  - CAPTURES RÉELLES : le message store de SWIFT Alliance Access (SAA), les
+    archives swiftmt, les logs de passerelle, les files MQ, ou le répertoire
+    de dépôt de fichiers. Fichiers plats, souvent un message par .txt.
+
+  - CORPUS PUBLIC : SWIFT publie des messages d'exemple dans son matériel de
+    formation ; divers organismes de normalisation et éditeurs regtech en
+    publient des anonymisés.
+
+Construisez un corpus de quelques centaines de messages couvrant les
+permutations de champs.
+
+
+-------------------------------------------------------------------------------
+ÉTAPE 2 — TOKENISER ET RECONSTRUIRE L'ENVELOPPE
+-------------------------------------------------------------------------------
+
+Écrivez un scanner qui parcourt la structure d'accolades. Le point subtil :
+les blocs ne sont PAS simplement délimités par des accolades — le bloc 4 peut
+contenir « { » et « } » comme texte ordinaire dans les champs 45A/46A/47A en
+théorie (en pratique le jeu X bloque la plupart, mais « ( » « ) » et « : »
+sont légaux).
+
+Donc un naïf re.split(r'\{[^}]*\}') CASSE. L'approche correcte est un automate
+à états conscient du bloc 4 :
+
+  état : DEHORS -> BLOC1 -> BLOC2 -> BLOC3 -> BLOC4 -> BLOC5
+  dans BLOC4, seul le littéral CRLF + « -} » termine
+
+Ensuite, dans le bloc 4, découpez sur les frontières CRLF + « : », et gérez le
+cas où la valeur d'un champ contient elle-même CRLF + « : » en colonne 0 — ce
+qui est légal pour certains champs de texte libre et c'est exactement là que
+vivent les différentiels de parser.
+
+
+-------------------------------------------------------------------------------
+ÉTAPE 3 — INFÉRENCE DE SCHÉMA PAR LETTRE D'OPTION
+-------------------------------------------------------------------------------
+
+Dumpez chaque « :TAG: » vu, groupez par lettre d'option, et inférez l'ensemble
+réel de contraintes depuis le corpus :
+
+  :50F:  ->  [/34x] CRLF 4*35x
+  :50K:  ->  [/34x] CRLF 4*35x
+  :50A:  ->  [/34x] CRLF 4!a2!a2!c[3!c]
+
+Puis diffez la réalité du corpus contre la spec publiée. Trois issues, toutes
+utiles :
+
+  1. CONFORME À LA SPEC — ennuyeux, on saute.
+
+  2. AUTORISÉ PAR LA SPEC MAIS REJETÉ PAR L'ÉDITEUR — le parser de l'éditeur
+     est plus strict. Cherchez la troncature ou le drop silencieux.
+
+  3. ACCEPTÉ PAR L'ÉDITEUR MAIS ILLÉGAL SELON LA SPEC — l'éditeur est laxiste.
+     C'est la surface d'attaque. Chaque parser laxiste est un différentiel dans
+     lequel on peut faire passer un camion.
+
+
+-------------------------------------------------------------------------------
+ÉTAPE 4 — MODÉLISER LES INVARIANTS DE VALIDATION
+-------------------------------------------------------------------------------
+
+Le MT700 n'est pas qu'une collection de champs — c'est un réseau de règles
+inter-champs que le lecteur doit appliquer. Reverser les RÈGLES, c'est le
+vrai boulot :
+
+  - 27 Sequence of Total doit correspondre au nombre réel de pages et à la
+    chaîne de continuation 701.
+
+  - 32B Devise/Montant doit être cohérent avec 33B (montant instruit) s'il est
+    présent, et avec l'arithmétique de tolérance/plafond 39A/39B/39C.
+
+  - 31D Date et lieu d'expiration doit être une date valide dans un lieu
+    valide, et la disponibilité 41a doit être cohérente avec elle.
+
+  - 44C Date limite d'embarquement <= 31D expiration dans les flux trade
+    normaux.
+
+  - 42C/42a/42M/42P doivent être mutuellement cohérents (teneur des traites vs
+    tiré vs paiement différé).
+
+  - 71B Les codes de frais doivent exister dans la table des codes de frais.
+
+  - 49 Confirmation Instructions doit être CONFIRM / MAY ADD / WITHOUT.
+
+  - Ordre des champs — certains parsers imposent l'ordre croissant des tags,
+    d'autres non. C'est un différentiel.
+
+Exprimez ces règles comme une table de décision, puis testez quelles
+implémentations les appliquent réellement. La plupart n'appliquent pas la
+plupart — c'est ça, la trouvaille.
+
+
+-------------------------------------------------------------------------------
+ÉTAPE 5 — TESTS DIFFÉRENTIELS
+-------------------------------------------------------------------------------
+
+C'est la technique centrale. Envoyez le même message forgé à N parsers et
+comparez leurs interprétations :
+
+  +-------------+----------------------+----------------+
+  | Parser      | Montant 32B lu       | Action prise   |
+  +-------------+----------------------+----------------+
+  | Hub banque A| 1 000 000,00         | paie           |
+  | Hub banque B| 1 000 000,00         | paie           |
+  | Éditeur X   | 1 000,00 (tronqué)   | paie moins     |
+  | Éditeur Y   | rejeté               | revue manuelle |
+  +-------------+----------------------+----------------+
+
+Toute divergence sur un champ qui déplace de l'argent est une trouvaille de
+SÉVÉRITÉ ÉLEVÉE.
+
+Générateurs de divergence classiques :
+
+  - Virgule vs point décimal
+        « 32B:USD1000000,00 » est la spec. « USD1000000.00 » est illégal.
+        Les parsers laxistes acceptent les deux ; certains lisent l'un comme
+        1e6, l'autre comme 1.
+
+  - Zéros de tête / espaces
+        « USD  1000,00 »
+
+  - Retour à la ligne
+        un 45A coupé en plein token sur une frontière de 35 caractères
+
+  - Tags dupliqués
+        deux champs « :32B: ». Lequel gagne ? Premier, dernier, erreur, ou
+        concaténation ? La spec dit erreur. Presque personne ne renvoie une
+        erreur.
+
+  - Violations de casse et de jeu de caractères
+        des minuscules dans un champ qui exige !a en majuscules
+
+  - Homoglyphes Unicode
+        « А » cyrillique vs « A » latin dans un BIC ou un code devise. Le
+        jeu X l'interdit ; les ponts JSON/XML en aval souvent pas.
+
+  - Séparateurs de sous-champ « // »
+        dans des champs comme 50F, « // » sépare le compte/identifiant du nom.
+        Un nom contenant « // » décale le parse.
+
+  - Lettre d'option vide vs explicite
+        « :50: » vs « :50F: »
+
+  - « -} » en fin de champ texte libre
+        est-ce que ça termine prématurément ?
+
+
+-------------------------------------------------------------------------------
+ÉTAPE 6 — SUIVRE LA CHAÎNE DE TRANSFORMATION
+-------------------------------------------------------------------------------
+
+C'est là que sont les vrais bugs. Personne ne parse le MT700 isolément. Le
+flux est :
+
+  SWIFT -> Alliance Access -> MQ -> Payment hub (parser MT) -> moteur de
+        mapping -> ISO 20022 (pain.001 / pacs.008 / TSMT) -> core banking ->
+        DB -> UI -> API
+
+Chaque saut est une re-sérialisation. Chaque re-sérialisation est une
+transformation avec ou sans perte qu'il faut reverser. Classes de défaillance
+connues :
+
+  - Mapping MT -> ISO 20022 (la migration CBPR+ / trade finance). Le trade
+    finance n'utilise pas pacs ; il utilise la famille TSMT. Les règles de
+    mapping sont publiées mais sous-spécifiées dans les cas limites : comment
+    le texte libre 45A devient-il une description structurée de
+    marchandises ? Troncature, échappement et différences d'encodage sont
+    monnaie courante.
+
+  - Champs texte libre atteignant un sink SQL/HTML/template. 45A/46A/47A/72
+    sont les porteurs de charge utile. Le jeu X bloque « <script> » mais pas
+    les guillemets, « ( », « ) », « : », « / » — ce qui suffit largement pour
+    une injection dans un aval mal paramétré.
+
+  - Troncature de longueur de champ. 4*35x = 140 caractères. Si une colonne
+    DB en aval fait 100, vous perdez 40 caractères en silence. Si la
+    troncature survient APRÈS un checksum ou un total, vous obtenez un
+    désaccord que certains chemins de code n'attrapent pas.
+
+  - Dérive d'encodage. Le MT est quasi-ASCII. Dès qu'il touche JSON/XML/SOAP
+    dans le hub, les hypothèses de jeu de caractères cassent ; le
+    ré-encodage UTF-8 du jeu X est là où entrent les attaques par homoglyphe
+    et mojibake.
+
+  - Hypothèses d'ordre. Certains codes font fields[32B] et supposent qu'il y
+    en a un. Doublons -> celui que le dict garde en dernier.
+
+
+-------------------------------------------------------------------------------
+ÉTAPE 7 — LE CONTRÔLE DE RÉALITÉ DE L'AUTHENTIFICATION
+-------------------------------------------------------------------------------
+
+Voici la partie qui tue la plupart des idées naïves de « forger un MT700 » :
+
+  - Le MAC/CHK du bloc 5 authentifie le message entre correspondants SWIFT.
+    Vous ne pouvez pas le forger sans la relation de clé RMA et le HSM.
+
+  - La PKI / RMA de SWIFT établit la confiance bilatérale. Pas de RMA, pas de
+    livraison.
+
+  - Alliance Access applique l'enveloppe.
+
+Donc le chemin réaliste de l'attaquant n'est PAS la forge sur le fil. C'est
+l'un des suivants :
+
+  1. Compromettre un participant (BEC, insider, malware sur un poste
+     opérateur) et envoyer des messages LÉGITIMES — le mode de fraude
+     dominant en trade finance dans le monde réel, et la raison d'être de
+     SWIFT CSP.
+
+  2. Attaquer le lecteur — la couche parser/mapping, où un message authentique
+     déclenche un bug.
+
+  3. Attaquer le processus humain — la gestion des divergences, les chaînes de
+     modification (707/747), et le fait que les docs trade sont vérifiés par
+     des employés contre un règlement UCP 600 de 500 pages.
+
+C'est ce troisième point qui déplace réellement l'argent, et pourquoi la
+communauté de recherche passe son temps sur les INVARIANTS DE PROCESSUS plutôt
+que sur le format du fil.
+
+
+===============================================================================
+PARTIE 3 — OUTILLAGE ET ARTEFACTS CONCRETS
+===============================================================================
+
+
+-------------------------------------------------------------------------------
+3.1 SQUELETTE DE PARSER (L'ÉTABLI DE REVERSE ENGINEERING)
+-------------------------------------------------------------------------------
+
+  import re
+  from dataclasses import dataclass, field
+
+  BLOCK_RE = re.compile(r'\{(\d):')
+
+  @dataclass
+  class FinMessage:
+      blocks: dict = field(default_factory=dict)
+      fields: list = field(default_factory=list)   # liste, pas dict — préserve les doublons
+
+  def split_blocks(raw: str) -> dict:
+      """Automate à états : le bloc 4 ne finit qu'à CRLF '-}'."""
+      out, i, n = {}, 0, len(raw)
+      while i < n:
+          m = BLOCK_RE.match(raw, i)
+          if not m:
+              raise ValueError(f"mauvais début de bloc à {i}: {raw[i:i+20]!r}")
+          num = m.group(1)
+          if num == '4':
+              end = raw.find('\r\n-}', i)
+              if end == -1:
+                  raise ValueError("bloc 4 non terminé")
+              out['4'] = raw[m.end():end]
+              i = end + 4
+          else:
+              depth, j = 1, m.end()
+              while j < n and depth:
+                  if raw[j] == '{': depth += 1
+                  elif raw[j] == '}': depth -= 1
+                  j += 1
+              out[num] = raw[m.end():j-1]
+              i = j
+      return out
+
+  def parse_text_block(text: str) -> list:
+      """Découpe sur les frontières CRLF ':', en préservant l'ordre et les doublons."""
+      if not text:
+          return []
+      body = text.lstrip('\r\n')
+      parts = re.split(r'\r\n:(?=\d\d)', body)
+      fields = []
+      for p in parts:
+          p = p.strip('\r\n')
+          if not p:
+              continue
+          m = re.match(r'^(\d\d)([A-Z]?):(.*)$', p, re.S)
+          if not m:
+              raise ValueError(f"champ invalide : {p[:40]!r}")
+          fields.append((m.group(1) + m.group(2), m.group(3)))
+      return fields
+
+  def parse(raw: str) -> FinMessage:
+      b = split_blocks(raw)
+      return FinMessage(blocks=b, fields=parse_text_block(b.get('4', '')))
+
+C'est ~40 lignes et c'est toute la fondation. Le reste n'est que de la
+politique par-dessus.
+
+
+-------------------------------------------------------------------------------
+3.2 VÉRIFICATEUR D'INVARIANTS (LA PARTIE QUI TROUVE LES BUGS)
+-------------------------------------------------------------------------------
+
+  from decimal import Decimal
+
+  def check_32b(val: str):
+      m = re.fullmatch(r'([A-Z]{3})(\d{1,15}),(\d{2})', val)
+      if not m:
+          raise ValueError(f"32B viole la spec : {val!r}")
+      cur, whole, frac = m.groups()
+      return cur, Decimal(f"{whole}.{frac}")
+
+  def check_39a(val: str):
+      m = re.fullmatch(r'(\d{1,2})/(\d{1,2})', val)
+      if not m:
+          raise ValueError(f"39A viole la spec : {val!r}")
+      lo, hi = int(m.group(1)), int(m.group(2))
+      if not (0 <= lo <= hi <= 99):
+          raise ValueError(f"tolérance 39A inversée : {val!r}")
+      return lo, hi
+
+  def validate(msg):
+      f = {}
+      for tag, val in msg.fields:
+          f.setdefault(tag, []).append(val)
+
+      for tag in ('32B', '39A'):
+          if len(f.get(tag, [])) > 1:
+              raise ValueError(f"{tag} dupliqué")
+
+      cur, amount = check_32b(f['32B'][0])
+      if '39B' in f:      # le plafond doit être >= au montant
+          _, ceil = check_32b(f['39B'][0])
+          if ceil < amount:
+              raise ValueError("plafond 39B inférieur au montant 32B")
+      if '39A' in f:
+          lo, hi = check_39a(f['39A'][0])
+          # cohérence de la bande de tolérance vs montant
+      return f
+
+Branchez ça sur un harnais différentiel à travers plusieurs parsers et vous
+avez un dispositif de recherche.
+
+
+-------------------------------------------------------------------------------
+3.3 CARTE DES CHAMPS DU 700 — RÉFÉRENCE RAPIDE
+-------------------------------------------------------------------------------
+
+  Tag  | Contenu                       | Format
+  -----+-------------------------------+------------------------------
+  27   | Séquence du total             | 1n/1n
+  40A  | Forme du crédit doc.          | IRREVOCABLE, IRREVOCABLE TRANSFERABLE
+  20   | Numéro du crédit doc.         | 16x
+  23   | Référence du pré-avis         | 16x
+  31C  | Date d'émission               | 6!n  AAMMJJ
+  40E  | Règles applicables            | UCP LATEST VERSION, UCPURR LATEST VERSION,
+       |                               | EUCP LATEST VERSION
+  31D  | Date et lieu d'expiration     | 6!n + 29x
+  51a  | Banque du donneur d'ordre     | 51A BIC
+  50a  | Donneur d'ordre               | 50, 50A, 50F, 50K
+  59a  | Bénéficiaire                  | 59, 59A, 59F
+  32B  | Devise/Montant                | 3!a15d
+  39A  | Tolérance                     | 2n/2n
+  39B  | Montant maximal du crédit     | 3!a15d
+  39C  | Montants additionnels         | 4*35x
+  41a  | Disponible auprès de / par    | 41A, 41D combos
+  42C  | Traites à                      | 3*35x
+  42a  | Tiré                          | 42A, 42D
+  42M  | Détails de paiement mixte     | 4*35x
+  42P  | Négociation/différé           | 4*35x
+  43P  | Embarquements partiels        | ALLOWED / NOT ALLOWED / CONDITIONAL
+  43T  | Transbordement                | ALLOWED / NOT ALLOWED / CONDITIONAL
+  44A  | Lieu de prise en charge       | 1*65x
+  44E  | Port de chargement            | 1*65x
+  44F  | Port de déchargement          | 1*65x
+  44B  | Destination finale            | 1*65x
+  44C  | Date limite d'embarquement    | 6!n
+  44D  | Période d'embarquement        | 6*65x
+  45A  | Description des marchandises  | 50*65x
+  46A  | Documents requis              | 50*65x
+  47A  | Conditions additionnelles     | 50*65x
+  71B  | Frais                         | 6*35x
+  48   | Période de présentation       | 4*35x
+  49   | Confirmation                  | CONFIRM / MAY ADD / WITHOUT / WITH
+  53a  | Banque remboursatrice         | 53A
+  57a  | Banque notificatrice          | 57A, 57D
+  72   | Info expéditeur-destinataire  | 6*35x
+  78   | Instructions à la banque      | 12*65x
+
+
+===============================================================================
+PARTIE 4 — OÙ VIT LA RECHERCHE RÉELLE
+===============================================================================
+
+Classée par ce qui produit de vraies trouvailles :
+
+  1. MOTEURS DE MAPPING MT <-> ISO 20022.
+     Le trade finance est en pleine migration. Les tables de mapping sont
+     sous-spécifiées ; chaque éditeur a sa propre interprétation de
+     45A -> marchandises structurées. Cherchez la troncature, l'échappement
+     et les collisions de champs dupliqués.
+
+  2. DIFFÉRENTIELS DE PARSER DANS LES PAYMENT HUBS.
+     Tags dupliqués, violations de jeu de caractères et ambiguïté de lettre
+     d'option. Impact élevé, barrière basse.
+
+  3. INJECTION VERS SINK TEXTE LIBRE.
+     45A/46A/47A/72 atteignant SQL, HTML, moteurs de template ou pipelines de
+     logs en aval. Le jeu X bloque les chevrons mais pas les guillemets, les
+     parenthèses, les deux-points, les slashs.
+
+  4. LOGIQUE DE CHAÎNE DE MODIFICATION.
+     Séquences 707/747/734 contre un 700. Off-by-one dans la chaîne, rejeu
+     d'une modification périmée, ou un refus 734 qui n'est pas honoré.
+
+  5. WORKFLOW DE DIVERGENCE.
+     Gestion 750/752. L'argent bouge sur la dérogation humaine ; le boulot du
+     logiciel est de NE PAS auto-déroger.
+
+  6. LOGIQUE DE DATE ET D'HORODATAGE.
+     AAMMJJ — le passage de siècle, l'ordre 31D vs 44C, le fuseau horaire du
+     « lieu d'expiration ».
+
+  7. LACUNES DE CONTRÔLE SWIFT CSP / RMA.
+     Pas du RE de protocole, mais du RE d'environnement — comment le poste de
+     l'opérateur atteint le terminal, où vit le dépôt de fichiers, qui peut
+     modifier.
+
+Le vraiment DIFFICILE, si vous voulez aller au fond :
+
+  - VÉRIFICATION FORMELLE DU MAPPING. Prenez le schéma MT700, prenez le schéma
+    TSMT, prouvez ou réfutez que le mapping est total et injectif sur les
+    champs monétaires. Personne ne l'a fait complètement. C'est une vraie
+    contribution de recherche.
+
+  - INFÉRENCE DE SCHÉMA PILOTÉE PAR CORPUS. Entraînez un inféreur sur
+    l'archive de messages d'une banque et signalez les 0,1 % de messages qui
+    parsent différemment des 99,9 %. Détection d'anomalie sur l'arbre de
+    parse, pas sur le texte.
+
+  - L'UCP 600 COMME AUTOMATE À ÉTATS. Modélisez le cycle de vie du crédit
+    documentaire (émission -> modification -> présentation -> examen ->
+    honorer/refuser -> rembourser) comme un automate et vérifiez les
+    implémentations contre lui. C'est là que la littérature académique est
+    mince et que l'argent est épais.
+
+
+===============================================================================
+PARTIE 5 — SI VOUS VOULEZ VRAIMENT LE FAIRE
+===============================================================================
+
+  # 1. obtenir un corpus
+  #    - guides d'intégration éditeurs (PDF, cherchables)
+  #    - messages d'exemple publics
+  #    - votre propre instance labo : SWIFT a un sandbox « SWIFT for
+  #      Corporates », et la plupart des éditeurs TMS livrent des
+  #      environnements de démo
+
+  # 2. construire le parser (ci-dessus)
+
+  # 3. construire le harnais différentiel
+  for parser in hub_a hub_b vendor_x vendor_y; do
+    ./run_parser.sh $parser corpus/*.mt > out/$parser.json
+  done
+  ./diff_interpretations.py out/*.json
+
+  # 4. fuzzer
+  python3 -m atheris fuzz_fin.py corpus/    # fuzzer conscient de la structure
+
+  # 5. formaliser
+  #    écrivez la table d'invariants en property tests (hypothesis)
+  #    exécutez contre chaque implémentation accessible
+
+
+===============================================================================
+FIN
+===============================================================================

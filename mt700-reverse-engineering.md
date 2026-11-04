@@ -1,0 +1,576 @@
+# REVERSING MT700 — SWIFT DOCUMENTARY CREDIT PROTOCOL
+
+*A practical guide to reverse engineering MT700 parsing, validation and mapping*
+
+## Table of contents
+
+- [PART 1 — WHAT MT700 ACTUALLY IS](#part-1--what-mt700-actually-is)
+    - [1.1 FIN ENVELOPE — THE FIVE BLOCKS](#11-fin-envelope--the-five-blocks)
+    - [1.2 FIELD GRAMMAR INSIDE BLOCK 4](#12-field-grammar-inside-block-4)
+- [PART 2 — HOW REVERSE ENGINEERING ACTUALLY PROCEEDS](#part-2--how-reverse-engineering-actually-proceeds)
+  - [STEP 1 — ACQUIRE SPECIMENS](#step-1--acquire-specimens)
+  - [STEP 2 — TOKENIZE AND RECONSTRUCT THE ENVELOPE](#step-2--tokenize-and-reconstruct-the-envelope)
+  - [STEP 3 — SCHEMA INFERENCE PER OPTION LETTER](#step-3--schema-inference-per-option-letter)
+  - [STEP 4 — MODEL THE VALIDATION INVARIANTS](#step-4--model-the-validation-invariants)
+  - [STEP 5 — DIFFERENTIAL TESTING](#step-5--differential-testing)
+  - [STEP 6 — FOLLOW THE TRANSFORMATION CHAIN](#step-6--follow-the-transformation-chain)
+  - [STEP 7 — THE AUTHENTICATION REALITY CHECK](#step-7--the-authentication-reality-check)
+- [PART 3 — CONCRETE TOOLING AND ARTIFACTS](#part-3--concrete-tooling-and-artifacts)
+    - [3.1 A PARSER SKELETON (THE REVERSE-ENGINEERING WORKBENCH)](#31-a-parser-skeleton-the-reverse-engineering-workbench)
+    - [3.2 INVARIANT CHECKER (THE PART THAT FINDS BUGS)](#32-invariant-checker-the-part-that-finds-bugs)
+    - [3.3 FIELD MAP FOR 700 — QUICK REFERENCE](#33-field-map-for-700--quick-reference)
+- [PART 4 — WHERE THE ACTUAL RESEARCH LIVES](#part-4--where-the-actual-research-lives)
+- [PART 5 — IF YOU WANT TO ACTUALLY DO IT](#part-5--if-you-want-to-actually-do-it)
+- [END](#end)
+
+First thing to get straight: nobody "hacks MT700 on the wire." The wire is signed. What people actually reverse engineer is THE SOFTWARE THAT READS MT700 — the middleware, mapping engines, and trade-finance front-ends that sit between SWIFT and the bank's core. That's where the protocol gets interesting, because that's where the parser makes decisions the spec doesn't fully constrain.
+
+## PART 1 — WHAT MT700 ACTUALLY IS
+
+MT700 is a SWIFT FIN message: "Issue of a Documentary Credit". It is the instruction a bank sends to advise/issue a letter of credit in trade finance. Plain text, fixed grammar, tag-driven.
+
+Sibling messages:
+
+```text
+  MT 700  Issue of Documentary Credit
+  MT 701  Continuation of a 700
+  MT 705  Pre-Advice
+  MT 707  Amendment
+  MT 710  Advice of a third bank's DC
+  MT 711  Advice of a third bank's DC (continuation)
+  MT 720  Transfer of a DC
+  MT 721  Transfer of a DC (continuation)
+  MT 734  Advice of Refusal
+  MT 740  Assignment of Proceeds
+  MT 747  Amendment of Charges
+  MT 750  Advice of Discrepancy
+  MT 752  Authorization to Pay / Accept / Negotiate
+```
+
+#### 1.1 FIN ENVELOPE — THE FIVE BLOCKS
+
+Every FIN message is a flat string of blocks:
+
+```text
+  {1:F01BANKBEBBAXXX0000000000}
+  {2:I700BANKUS33XXXXN}
+  {3:{108:REF1234567890}{111:001}{121:uuid-here}}
+  {4:
+  :27:1/1
+  :40A:IRREVOCABLE
+  :20:LC123456789
+  :31C:251104
+  :40E:UCP LATEST VERSION
+  ...
+  -}
+  {5:{MAC:12345678}{CHK:ABCDEF123456}}
+```
+
+```text
+  Block 1 — Basic Header
+      App id "F" (FIN), service id "01", LT address (12 chars: bank BIC8 +
+      branch + terminal), session/sequence; for output also OS/seq.
+```
+
+```text
+  Block 2 — Application Header
+      "I" = input, "O" = output, message type "700", destination/source LT,
+      priority, delivery monitoring, obsolescence period.
+```
+
+```text
+  Block 3 — User Header (optional)
+      Contains 108 (Message User Reference, MUR), 111/113 (service
+      identifiers), 121 (unique end-to-end transaction reference, UETR),
+      152 (validation), 165/433, etc.
+```
+
+```text
+  Block 4 — Text Block
+      The actual MT700 payload. ":TAG:value" lines, CRLF separated,
+      terminated by "-}".
+```
+
+```text
+  Block 5 — Trailer
+      {MAC:...} (legacy authenticator) and {CHK:...} (checksum), plus possible
+      {PDE:}, {DLM:}, {TNG:}.
+```
+
+#### 1.2 FIELD GRAMMAR INSIDE BLOCK 4
+
+A field is ":NNx:" where NN is the number and x an optional OPTION LETTER that changes the format entirely.
+
+```text
+Example: field 50 has options:
+  50    (no letter, obsolete)
+  50A   BIC
+  50F   party identifier + name/address
+  50K   account + name/address
+```
+
+Same number, completely different schema.
+
+Format codes in the standard look like:
+
+```text
+  50a   [/34x] 4!a2!a2!c[3!c]   or   [/34x] 4*35x
+  59    [/34x] 4*35x
+  32B   3!a 15d
+  39A   2n/2n
+  45A   50*65x
+  46A   50*65x
+```
+
+```text
+Read that as:
+  4*35x  = up to 4 lines of up to 35 chars
+  3!a    = exactly 3 alphabetic (currency)
+  15d    = up to 15 digits, comma as decimal separator
+```
+
+This is the whole schema language — a tiny regex dialect.
+
+```text
+CHARACTER SET (X charset):
+  a-z A-Z 0-9 / - ? : ( ) . , ' + and space
+  No "&", no "#", no "<", ">", no quote character.
+  Some fields use restricted sets:
+    n = numeric
+    c = A-Z a-z 0-9 plus some punctuation
+    x = any X char
+```
+
+That restriction is the reason classic MT is injection-resistant BY CONSTRUCTION — but only if the parser enforces it.
+
+## PART 2 — HOW REVERSE ENGINEERING ACTUALLY PROCEEDS
+
+Real methodology, in order. Same pipeline whether you're a security researcher auditing a payment hub or a fraud analyst reverse-engineering a scam.
+
+### STEP 1 — ACQUIRE SPECIMENS
+
+Sources, roughly by how clean they are:
+
+- PUBLIC SPEC: SWIFT's own "Standards MT" volumes are paywalled but widely mirrored; the field catalogue for 700 is well documented in trade-finance literature.
+
+- VENDOR DOCS: every TMS (trade management system) ships sample messages in its integration guide — Finastra, CGI, Finacle, Tietoevry, and the middleware crowd (IBM Transformation Extender, Axway, Bottomline, ACI, Volante). These guides are goldmines: they show THEIR interpretation.
+
+- REAL CAPTURES: SWIFT Alliance Access (SAA) message store, swiftmt archives, gateway logs, MQ queues, or the file drop directory. Flat files, often one message per .txt.
+
+- PUBLIC CORPUS: SWIFT publishes sample messages in training material; various standards bodies and regtech vendors publish anonymized ones.
+
+Build a corpus of a few hundred messages covering the field permutations.
+
+### STEP 2 — TOKENIZE AND RECONSTRUCT THE ENVELOPE
+
+Write a scanner that walks the brace structure. The subtle part: blocks are NOT simply brace-delimited — block 4 may contain "{" and "}" as ordinary text in fields 45A/46A/47A in theory (in practice X charset blocks most, but "(" ")" and ":" are legal).
+
+So a naive re.split(r'\{[^}]*\}') BREAKS. Correct approach is a state machine with block-4 awareness:
+
+```text
+  state: OUTSIDE -> BLOCK1 -> BLOCK2 -> BLOCK3 -> BLOCK4 -> BLOCK5
+  in BLOCK4, only the literal CRLF + "-}" terminates
+```
+
+Then within block 4, split on CRLF + ":" boundaries, and handle the case where a field's value itself contains CRLF + ":" at column 0 — which is legal for some free-text fields and is exactly where parser differentials live.
+
+### STEP 3 — SCHEMA INFERENCE PER OPTION LETTER
+
+Dump every ":TAG:" you've seen, group by option letter, and infer the actual constraint set from the corpus:
+
+```text
+  :50F:  ->  [/34x] CRLF 4*35x
+  :50K:  ->  [/34x] CRLF 4*35x
+  :50A:  ->  [/34x] CRLF 4!a2!a2!c[3!c]
+```
+
+Then diff corpus reality against the published spec. Three outcomes, all useful:
+
+```text
+  1. SPEC-CONFORMANT — boring, skip.
+```
+
+```text
+  2. SPEC-ALLOWED BUT VENDOR-REJECTED — the vendor's parser is stricter.
+     Look for truncation or silent drop.
+```
+
+```text
+  3. VENDOR-ACCEPTED BUT SPEC-ILLEGAL — the vendor is lenient. This is the
+     attack surface. Every lenient parser is a differential you can drive a
+     truck through.
+```
+
+### STEP 4 — MODEL THE VALIDATION INVARIANTS
+
+MT700 isn't just fields — it's a web of cross-field rules the reader must enforce. Reverse-engineering the RULES is the actual job:
+
+- 27 Sequence of Total must match actual page count and the 701 continuation chain.
+
+- 32B Currency/Amount must be consistent with 33B (instructed amount) if present, and with 39A/39B/39C tolerance/ceiling math.
+
+- 31D Date and Place of Expiry must be a valid date in a valid place, and 41a availability must be coherent with it.
+
+- 44C Latest Date of Shipment <= 31D expiry in normal trade flows.
+
+- 42C/42a/42M/42P must be mutually coherent (drafts tenor vs drawee vs deferred payment).
+
+- 71B Charges codes must exist in the charge code table.
+
+- 49 Confirmation Instructions must be one of CONFIRM / MAY ADD / WITHOUT.
+
+- Field ordering — some parsers enforce ascending tag order, some don't. That's a differential.
+
+Express these as a decision table, then test which implementations actually enforce them. Most don't enforce most of them — that's the finding.
+
+### STEP 5 — DIFFERENTIAL TESTING
+
+This is the core technique. Feed the same crafted message to N parsers and compare their interpretations:
+
+```text
+  +-------------+----------------------+--------------+
+  | Parser      | 32B amount read      | Action taken |
+  +-------------+----------------------+--------------+
+  | Bank A hub  | 1,000,000.00         | pay          |
+  | Bank B hub  | 1,000,000.00         | pay          |
+  | Vendor X    | 1,000.00 (truncated) | pay less    |
+  | Vendor Y    | rejected             | manual review|
+  +-------------+----------------------+--------------+
+```
+
+Any divergence in a money-moving field is a HIGH-SEVERITY finding.
+
+Classic divergence generators:
+
+- Decimal comma vs point "32B:USD1000000,00" is spec. "USD1000000.00" is illegal. Lenient parsers accept both; some misread one as 1e6, some as 1.
+
+- Leading zeros / whitespace "USD 1000,00"
+
+- Line wrapping a 45A split mid-token across a 35-char boundary
+
+- Duplicate tags two ":32B:" fields. Which wins? First, last, error, or concatenation? Spec says error. Almost nobody errors.
+
+- Case and charset violations lowercase in a field that demands !a uppercase
+
+- Unicode homoglyphs Cyrillic "A" vs Latin "A" in a BIC or currency code. X charset forbids it; JSON/XML bridges downstream often don't.
+
+- "//" subfield separators in fields like 50F, "//" separates account/identifier from name. A name containing "//" shifts the parse.
+
+- Empty option letter vs explicit ":50:" vs ":50F:"
+
+- Trailing "-}" inside a free-text field does it terminate early?
+
+### STEP 6 — FOLLOW THE TRANSFORMATION CHAIN
+
+This is where the real bugs are. Nobody parses MT700 in isolation. The flow is:
+
+```text
+  SWIFT -> Alliance Access -> MQ -> Payment hub (MT parser) -> mapping engine
+        -> ISO 20022 (pain.001 / pacs.008 / TSMT) -> core banking -> DB
+        -> UI -> API
+```
+
+Each hop is a re-serialization. Each re-serialization is a lossy or lossless transformation that you must reverse. Known failure classes:
+
+- MT -> ISO 20022 mapping (the CBPR+ / trade-finance migration). Trade finance doesn't use pacs; it uses the TSMT family. Mapping rules are published but under-specified in edge cases: how does 45A free text become structured goods description? Truncation, escaping, and encoding differences are routine.
+
+- Free-text fields reaching a SQL/HTML/template sink. 45A/46A/47A/72 are the payload carriers. X charset blocks "<script>" but not quote, "(", ")", ":", "/" — which is plenty for injection into a badly-parameterized downstream.
+
+- Field length truncation. 4*35x = 140 chars. If a downstream DB column is 100, you silently lose 40 chars. If the truncation happens AFTER a checksum or total, you get a mismatch that some code path doesn't catch.
+
+- Encoding drift. MT is ASCII-ish. The moment it hits JSON/XML/SOAP in the hub, charset assumptions break; UTF-8 re-encoding of X charset is where homoglyph and mojibake attacks enter.
+
+- Ordering assumptions. Some code does fields[32B] and assumes one. Duplicates -> whichever the dict holds last.
+
+### STEP 7 — THE AUTHENTICATION REALITY CHECK
+
+Here's the part that kills most naive "forge an MT700" ideas:
+
+- Block 5 MAC/CHK authenticates the message between SWIFT correspondents. You can't forge it without the RMA key relationship and the HSM.
+
+- SWIFT PKI / RMA establishes the bilateral trust. No RMA, no delivery.
+
+- Alliance Access enforces the envelope.
+
+So the attacker's realistic path is NOT forging on the wire. It's one of:
+
+```text
+  1. Compromise a participant (BEC, insider, malware on an operator
+     workstation) and send LEGITIMATE messages — the dominant real-world fraud
+     mode in trade finance, and why SWIFT CSP exists.
+```
+
+```text
+  2. Attack the reader — the parser/mapping layer, where an authentic message
+     triggers a bug.
+```
+
+```text
+  3. Attack the human process — discrepancy handling, amendment chains
+     (707/747), and the fact that trade docs are checked by clerks against a
+     500-page UCP 600 rulebook.
+```
+
+That third one is where the money actually moves, and why the research community spends its time on PROCESS INVARIANTS rather than wire format.
+
+## PART 3 — CONCRETE TOOLING AND ARTIFACTS
+
+#### 3.1 A PARSER SKELETON (THE REVERSE-ENGINEERING WORKBENCH)
+
+```text
+  import re
+  from dataclasses import dataclass, field
+```
+
+```text
+  BLOCK_RE = re.compile(r'\{(\d):')
+```
+
+```text
+  @dataclass
+  class FinMessage:
+      blocks: dict = field(default_factory=dict)
+      fields: list = field(default_factory=list)   # list, not dict — preserves duplicates
+```
+
+```text
+  def split_blocks(raw: str) -> dict:
+      """State machine: block 4 ends only at CRLF '-}'."""
+      out, i, n = {}, 0, len(raw)
+      while i < n:
+          m = BLOCK_RE.match(raw, i)
+          if not m:
+              raise ValueError(f"bad block start at {i}: {raw[i:i+20]!r}")
+          num = m.group(1)
+          if num == '4':
+              end = raw.find('\r\n-}', i)
+              if end == -1:
+                  raise ValueError("unterminated block 4")
+              out['4'] = raw[m.end():end]
+              i = end + 4
+          else:
+              depth, j = 1, m.end()
+              while j < n and depth:
+                  if raw[j] == '{': depth += 1
+                  elif raw[j] == '}': depth -= 1
+                  j += 1
+              out[num] = raw[m.end():j-1]
+              i = j
+      return out
+```
+
+```text
+  def parse_text_block(text: str) -> list:
+      """Split on CRLF ':' boundaries, preserving field order and duplicates."""
+      if not text:
+          return []
+      body = text.lstrip('\r\n')
+      parts = re.split(r'\r\n:(?=\d\d)', body)
+      fields = []
+      for p in parts:
+          p = p.strip('\r\n')
+          if not p:
+              continue
+          m = re.match(r'^(\d\d)([A-Z]?):(.*)$', p, re.S)
+          if not m:
+              raise ValueError(f"bad field: {p[:40]!r}")
+          fields.append((m.group(1) + m.group(2), m.group(3)))
+      return fields
+```
+
+```text
+  def parse(raw: str) -> FinMessage:
+      b = split_blocks(raw)
+      return FinMessage(blocks=b, fields=parse_text_block(b.get('4', '')))
+```
+
+That's ~40 lines and it's the whole foundation. Everything else is policy on top of it.
+
+#### 3.2 INVARIANT CHECKER (THE PART THAT FINDS BUGS)
+
+```text
+  from decimal import Decimal
+```
+
+```text
+  def check_32b(val: str):
+      m = re.fullmatch(r'([A-Z]{3})(\d{1,15}),(\d{2})', val)
+      if not m:
+          raise ValueError(f"32B violates spec: {val!r}")
+      cur, whole, frac = m.groups()
+      return cur, Decimal(f"{whole}.{frac}")
+```
+
+```text
+  def check_39a(val: str):
+      m = re.fullmatch(r'(\d{1,2})/(\d{1,2})', val)
+      if not m:
+          raise ValueError(f"39A violates spec: {val!r}")
+      lo, hi = int(m.group(1)), int(m.group(2))
+      if not (0 <= lo <= hi <= 99):
+          raise ValueError(f"39A tolerance inverted: {val!r}")
+      return lo, hi
+```
+
+```text
+  def validate(msg):
+      f = {}
+      for tag, val in msg.fields:
+          f.setdefault(tag, []).append(val)
+```
+
+```text
+      for tag in ('32B', '39A'):
+          if len(f.get(tag, [])) > 1:
+              raise ValueError(f"duplicate {tag}")
+```
+
+```text
+      cur, amount = check_32b(f['32B'][0])
+      if '39B' in f:      # ceiling must be >= amount
+          _, ceil = check_32b(f['39B'][0])
+          if ceil < amount:
+              raise ValueError("39B ceiling below 32B amount")
+      if '39A' in f:
+          lo, hi = check_39a(f['39A'][0])
+          # tolerance band sanity vs amount
+      return f
+```
+
+Feed that to a differential harness across parsers and you have a research setup.
+
+#### 3.3 FIELD MAP FOR 700 — QUICK REFERENCE
+
+```text
+  Tag  | Content                       | Format
+  -----+-------------------------------+------------------------------
+  27   | Sequence of Total             | 1n/1n
+  40A  | Form of DC                    | IRREVOCABLE, IRREVOCABLE TRANSFERABLE
+  20   | DC Number                     | 16x
+  23   | Pre-Advice Reference          | 16x
+  31C  | Date of Issue                 | 6!n  YYMMDD
+  40E  | Applicable Rules              | UCP LATEST VERSION, UCPURR LATEST VERSION,
+       |                               | EUCP LATEST VERSION
+  31D  | Date and Place of Expiry      | 6!n + 29x
+  51a  | Applicant Bank                | 51A BIC
+  50a  | Applicant                     | 50, 50A, 50F, 50K
+  59a  | Beneficiary                   | 59, 59A, 59F
+  32B  | Currency/Amount               | 3!a15d
+  39A  | Tolerance                     | 2n/2n
+  39B  | Max Credit Amount             | 3!a15d
+  39C  | Additional Amounts            | 4*35x
+  41a  | Available With / By           | 41A, 41D combos
+  42C  | Drafts At                     | 3*35x
+  42a  | Drawee                        | 42A, 42D
+  42M  | Mixed Payment Details         | 4*35x
+  42P  | Negotiation/Deferred          | 4*35x
+  43P  | Partial Shipments             | ALLOWED / NOT ALLOWED / CONDITIONAL
+  43T  | Transhipment                  | ALLOWED / NOT ALLOWED / CONDITIONAL
+  44A  | Place of Taking in Charge     | 1*65x
+  44E  | Port of Loading               | 1*65x
+  44F  | Port of Discharge             | 1*65x
+  44B  | Final Destination             | 1*65x
+  44C  | Latest Shipment Date          | 6!n
+  44D  | Shipment Period               | 6*65x
+  45A  | Description of Goods          | 50*65x
+  46A  | Documents Required            | 50*65x
+  47A  | Additional Conditions         | 50*65x
+  71B  | Charges                       | 6*35x
+  48   | Presentation Period           | 4*35x
+  49   | Confirmation                  | CONFIRM / MAY ADD / WITHOUT / WITH
+  53a  | Reimbursing Bank              | 53A
+  57a  | Advise Through Bank           | 57A, 57D
+  72   | Sender to Receiver Info       | 6*35x
+  78   | Instructions to Bank          | 12*65x
+```
+
+## PART 4 — WHERE THE ACTUAL RESEARCH LIVES
+
+Ranked by what produces real findings:
+
+```text
+  1. MT <-> ISO 20022 MAPPING ENGINES.
+     Trade finance is mid-migration. Mapping tables are under-specified; every
+     vendor has its own interpretation of 45A -> structured goods. Look for
+     truncation, escaping, and duplicate-field collisions.
+```
+
+```text
+  2. PARSER DIFFERENTIALS IN PAYMENT HUBS.
+     Duplicate tags, charset violations, and option-letter ambiguity. High
+     impact, low barrier.
+```
+
+```text
+  3. FREE-TEXT SINK INJECTION.
+     45A/46A/47A/72 reaching SQL, HTML, template engines, or logging
+     pipelines downstream. X charset blocks angle brackets but not quotes,
+     parens, colons, slashes.
+```
+
+```text
+  4. AMENDMENT CHAIN LOGIC.
+     707/747/734 sequences against a 700. Off-by-one in the chain, replay of
+     a stale amendment, or a 734 refusal that isn't honored.
+```
+
+```text
+  5. DISCREPANCY WORKFLOW.
+     750/752 handling. The money moves on the human waiver; the software's
+     job is to NOT auto-waive.
+```
+
+```text
+  6. TIMESTAMP AND DATE LOGIC.
+     YYMMDD — the century rollover, the 31D vs 44C ordering, timezone of
+     "expiry place."
+```
+
+```text
+  7. SWIFT CSP / RMA CONTROL GAPS.
+     Not protocol RE, but the environment RE — how the operator's workstation
+     reaches the terminal, where the file drop lives, who can amend.
+```
+
+The genuinely HARD stuff, if you want to go deep:
+
+- FORMAL VERIFICATION OF THE MAPPING. Take the MT700 schema, take the TSMT schema, prove or disprove the mapping is total and injective on money fields. Nobody has done this completely. It's a real research contribution.
+
+- CORPUS-DRIVEN SCHEMA INFERENCE. Train an inferrer on a bank's message archive and flag the 0.1% of messages that parse differently than the 99.9%. Anomaly detection on the parse tree, not the text.
+
+- UCP 600 AS A STATE MACHINE. Model the documentary-credit lifecycle (issue -> amend -> present -> examine -> honor/refuse -> reimburse) as an automaton and check implementations against it. This is where the academic literature is thin and the money is thick.
+
+## PART 5 — IF YOU WANT TO ACTUALLY DO IT
+
+```text
+  # 1. get a corpus
+  #    - vendor integration guides (PDFs, searchable)
+  #    - public sample messages
+  #    - your own lab instance: SWIFT has a "SWIFT for Corporates" sandbox,
+  #      and most TMS vendors ship demo environments
+```
+
+```text
+  # 2. build the parser (above)
+```
+
+```text
+  # 3. build the differential harness
+  for parser in hub_a hub_b vendor_x vendor_y; do
+    ./run_parser.sh $parser corpus/*.mt > out/$parser.json
+  done
+  ./diff_interpretations.py out/*.json
+```
+
+```text
+  # 4. fuzz
+  python3 -m atheris fuzz_fin.py corpus/    # structure-aware fuzzer
+```
+
+```text
+  # 5. formalize
+  #    write the invariant table as property tests (hypothesis)
+  #    run against every implementation you can reach
+```
+
+## END
