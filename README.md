@@ -3,9 +3,10 @@
 Recueil de notes d'analyse sur la mécanique de la fraude financière, des
 instruments de paiement et des intrusions bancaires.
 
-Chaque document existe en version anglaise et française, et en deux formats :
-`.txt` (mise en page fixe, 79 colonnes) et `.md` (édition Markdown avec sommaire
-cliquable).
+Les deux grands manuels existent en version anglaise et française, en deux
+formats : `.txt` (mise en page fixe, 79 colonnes) et `.md` (édition Markdown
+générée depuis le `.txt` avec un sommaire cliquable). Les notes plus courtes
+sont bilingues également, mais en `.md` uniquement.
 
 ## Documents
 
